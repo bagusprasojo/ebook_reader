@@ -1,0 +1,32 @@
+﻿# Maven / Java build output
+target/
+out/
+
+# Logs
+*.log
+
+# JavaFX runtime artifacts
+hs_err_pid*
+replay_pid*
+
+# Local app data / secrets
+.env
+.env.*
+config-local.properties
+reader-local.properties
+
+# IDE / OS
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# SQLite local files
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Downloaded packages
+*.bookpkg
