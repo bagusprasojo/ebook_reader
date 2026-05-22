@@ -439,13 +439,15 @@ public class MainWindow {
         private final ColorPicker highlightColor = new ColorPicker(Color.YELLOW);
         private final Slider annotationThickness = new Slider(1.0, 8.0, 2.0);
         private final Label zoomLabel = new Label("100%");
-        private final Button animModeBtn = new Button("Anim: V1");
+        private Button firstBtn;
+        private Button prevBtn;
+        private Button nextBtn;
+        private Button lastBtn;
+        private final TextField pageJump = new TextField("1");
         private double zoomScale = 1.0;
         private static final double ZOOM_MIN = 1.0;
         private static final double ZOOM_MAX = 3.0;
         private static final double ZOOM_STEP = 0.1;
-        private enum TurnAnimMode { SLIDE, CURL }
-        private TurnAnimMode turnAnimMode = TurnAnimMode.SLIDE;
         private boolean turnAnimating = false;
         private final Rectangle selectionRect = new Rectangle();
         private double selStartX = -1;
@@ -572,8 +574,13 @@ public class MainWindow {
                     persistCurrentStroke();
                 }
             });
-            Button prev = new Button("Prev"); prev.setOnAction(e -> turnPageAnimated(false));
-            Button next = new Button("Next"); next.setOnAction(e -> turnPageAnimated(true));
+            firstBtn = new Button("First"); firstBtn.setOnAction(e -> jumpToPage(1));
+            prevBtn = new Button("Prev"); prevBtn.setOnAction(e -> turnPageAnimated(false));
+            nextBtn = new Button("Next"); nextBtn.setOnAction(e -> turnPageAnimated(true));
+            lastBtn = new Button("Last"); lastBtn.setOnAction(e -> jumpToLastPage());
+            pageJump.setPrefColumnCount(4);
+            pageJump.setMaxWidth(64);
+            pageJump.setOnAction(e -> jumpToPageFromInput());
             Button zoomOutBtn = new Button("-"); zoomOutBtn.setOnAction(e -> zoomOut());
             Button zoomInBtn = new Button("+"); zoomInBtn.setOnAction(e -> zoomIn());
             TextField search = new TextField(); search.setPromptText("Search text in this book");
@@ -582,10 +589,6 @@ public class MainWindow {
             Button note = new Button("Note"); note.setOnAction(e -> addNote());
             ToggleButton annotationBtn = new ToggleButton("Annotation");
             ToggleButton highlight = new ToggleButton("Highlight");
-            animModeBtn.setOnAction(e -> {
-                turnAnimMode = (turnAnimMode == TurnAnimMode.SLIDE) ? TurnAnimMode.CURL : TurnAnimMode.SLIDE;
-                animModeBtn.setText(turnAnimMode == TurnAnimMode.SLIDE ? "Anim: V1" : "Anim: V2");
-            });
             highlight.setOnAction(e -> {
                 boolean on = highlight.isSelected();
                 highlightMode.setSelected(on);
@@ -624,8 +627,7 @@ public class MainWindow {
             annoTools.managedProperty().bind(annotationToolsToggle.selectedProperty());
 
             HBox toolbar = new HBox(6,
-                prev, next,
-                animModeBtn,
+                firstBtn, prevBtn, pageJump, nextBtn, lastBtn,
                 new Label("Zoom"), zoomOutBtn, zoomInBtn, zoomLabel,
                 bookmark, note,
                 highlight, hiTools,
@@ -723,7 +725,7 @@ public class MainWindow {
 
         private void turnPageAnimated(boolean forward) {
             if (turnAnimating) return;
-            int target = forward ? currentPage + 2 : Math.max(1, currentPage - 2);
+            int target = targetPage(forward);
             if (target == currentPage) return;
             turnAnimating = true;
             try {
@@ -743,96 +745,76 @@ public class MainWindow {
                 newView.setFitHeight(pageLayer.getHeight());
                 newView.setPreserveRatio(false);
 
-                transitionOverlay.getChildren().setAll(newView, oldView, makeTurnShadow(forward));
                 pages.setVisible(false);
                 highlightOverlay.setVisible(false);
                 annotation.setVisible(false);
                 selectionRect.setVisible(false);
 
-                if (turnAnimMode == TurnAnimMode.SLIDE) {
-                    playSlideTransition(forward, oldView, newView);
-                } else {
-                    playCurlTransition(forward, oldView, newView);
-                }
+                playCurlTransition(forward, oldView, newView);
             } catch (Exception ex) {
                 pages.setVisible(true);
                 highlightOverlay.setVisible(true);
                 annotation.setVisible(true);
                 transitionOverlay.getChildren().clear();
                 turnAnimating = false;
+                updateNavButtons();
                 LOG.log(Level.WARNING, "Page turn animation failed", ex);
             }
         }
 
-        private Rectangle makeTurnShadow(boolean forward) {
-            double w = Math.max(80, pageLayer.getWidth() * 0.18);
-            Rectangle shadow = new Rectangle(w, Math.max(200, pageLayer.getHeight()));
-            shadow.setManaged(false);
-            shadow.setMouseTransparent(true);
-            shadow.setFill(new LinearGradient(
-                0, 0, 1, 0, true, CycleMethod.NO_CYCLE,
-                forward
-                    ? new Stop[]{new Stop(0, Color.color(0, 0, 0, 0.22)), new Stop(1, Color.color(0, 0, 0, 0.02))}
-                    : new Stop[]{new Stop(0, Color.color(0, 0, 0, 0.02)), new Stop(1, Color.color(0, 0, 0, 0.22))}
-            ));
-            shadow.setTranslateX(forward ? pageLayer.getWidth() * 0.45 : -pageLayer.getWidth() * 0.45);
-            return shadow;
+        private int targetPage(boolean forward) {
+            try {
+                int total = reader.totalPages();
+                if (forward) {
+                    if (currentPage >= lastSpreadStart(total)) return currentPage;
+                    return Math.min(lastSpreadStart(total), currentPage + 2);
+                }
+                return Math.max(1, currentPage - 2);
+            } catch (Exception ex) {
+                return forward ? currentPage + 2 : Math.max(1, currentPage - 2);
+            }
         }
 
-        private void playSlideTransition(boolean forward, ImageView oldView, ImageView newView) {
-            double w = Math.max(300, pageLayer.getWidth());
-            double h = Math.max(240, pageLayer.getHeight());
-            double half = w / 2.0;
+        private int lastSpreadStart(int total) {
+            if (total <= 1) return 1;
+            return (total % 2 == 0) ? total : total - 1;
+        }
 
-            oldView.setVisible(false);
-            newView.setVisible(false);
+        private int normalizePageForSpread(int page) {
+            int p = Math.max(1, page);
+            if (p <= 1) return 1;
+            return (p % 2 == 0) ? p : p - 1;
+        }
 
-            ImageView oldLeft = halfView(oldView.getImage(), 0, half, h);
-            ImageView oldRight = halfView(oldView.getImage(), half, half, h);
-            ImageView newLeft = halfView(newView.getImage(), 0, half, h);
-            ImageView newRight = halfView(newView.getImage(), half, half, h);
-            oldLeft.setLayoutX(0); oldRight.setLayoutX(half);
-            newLeft.setLayoutX(0); newRight.setLayoutX(half);
-            oldLeft.setLayoutY(0); oldRight.setLayoutY(0);
-            newLeft.setLayoutY(0); newRight.setLayoutY(0);
-
-            if (forward) {
-                newRight.setTranslateX(half * 0.22);
-                newRight.setOpacity(0.55);
-                transitionOverlay.getChildren().setAll(newLeft, newRight, oldLeft, oldRight, makeTurnShadow(true));
-
-                TranslateTransition oldRightMove = new TranslateTransition(Duration.millis(260), oldRight);
-                oldRightMove.setToX(-half);
-                FadeTransition oldRightFade = new FadeTransition(Duration.millis(260), oldRight);
-                oldRightFade.setToValue(0.0);
-                TranslateTransition newRightMove = new TranslateTransition(Duration.millis(260), newRight);
-                newRightMove.setToX(0);
-                FadeTransition newRightFade = new FadeTransition(Duration.millis(260), newRight);
-                newRightFade.setFromValue(0.55);
-                newRightFade.setToValue(1.0);
-                ParallelTransition pt = new ParallelTransition(oldRightMove, oldRightFade, newRightMove, newRightFade);
-                pt.setOnFinished(e -> endTurnAnimation());
-                pt.play();
-                return;
+        private void jumpToPageFromInput() {
+            try {
+                jumpToPage(Integer.parseInt(pageJump.getText().trim()));
+            } catch (NumberFormatException ex) {
+                status.setText("Nomor halaman tidak valid");
+                updatePageJumpText();
             }
+        }
 
-            newLeft.setTranslateX(-half * 0.22);
-            newLeft.setOpacity(0.55);
-            transitionOverlay.getChildren().setAll(newLeft, newRight, oldLeft, oldRight, makeTurnShadow(false));
+        private void jumpToPage(int page) {
+            if (turnAnimating) return;
+            try {
+                int total = reader.totalPages();
+                int target = Math.min(lastSpreadStart(total), normalizePageForSpread(page));
+                currentPage = target;
+                render();
+            } catch (Exception ex) {
+                status.setText("Gagal menuju halaman: " + ex.getMessage());
+                updatePageJumpText();
+            }
+        }
 
-            TranslateTransition oldLeftMove = new TranslateTransition(Duration.millis(260), oldLeft);
-            oldLeftMove.setToX(half);
-            FadeTransition oldLeftFade = new FadeTransition(Duration.millis(260), oldLeft);
-            oldLeftFade.setToValue(0.0);
-            TranslateTransition newLeftMove = new TranslateTransition(Duration.millis(260), newLeft);
-            newLeftMove.setToX(0);
-            FadeTransition newLeftFade = new FadeTransition(Duration.millis(260), newLeft);
-            newLeftFade.setFromValue(0.55);
-            newLeftFade.setToValue(1.0);
-
-            ParallelTransition pt = new ParallelTransition(oldLeftMove, oldLeftFade, newLeftMove, newLeftFade);
-            pt.setOnFinished(e -> endTurnAnimation());
-            pt.play();
+        private void jumpToLastPage() {
+            try {
+                currentPage = lastSpreadStart(reader.totalPages());
+                render();
+            } catch (Exception ex) {
+                status.setText("Gagal menuju halaman terakhir: " + ex.getMessage());
+            }
         }
 
         private ImageView halfView(Image img, double x, double w, double h) {
@@ -863,99 +845,111 @@ public class MainWindow {
             newLeft.setLayoutY(0); newRight.setLayoutY(0);
 
             Rectangle gutterShadow = spineShadow(h);
-            Rectangle movingShadow = curlShadow(half, h, forward);
-            Rectangle edgeLight = curlEdgeLight(h, forward);
             Interpolator paperEase = Interpolator.SPLINE(0.18, 0.72, 0.18, 1.0);
+            int strips = 18;
+            double stripW = half / strips;
+            List<Animation> animations = new ArrayList<>();
 
             double moveX = 0;
             if (forward) {
-                StackPane flipping = new StackPane(oldRight, movingShadow, edgeLight);
-                flipping.setManaged(false);
-                flipping.setLayoutX(half);
-                flipping.setLayoutY(0);
-                flipping.setPrefSize(half, h);
-                flipping.setRotationAxis(Rotate.Y_AXIS);
-                flipping.getTransforms().add(new Shear(0.0, -0.025, 0, h / 2.0));
-                PerspectiveTransform pageShape = pagePerspective(half, h);
-                flipping.setEffect(pageShape);
                 newRight.setOpacity(0.0);
-                transitionOverlay.getChildren().setAll(newLeft, newRight, oldLeft, gutterShadow, flipping);
+                transitionOverlay.getChildren().setAll(newLeft, newRight, oldLeft, gutterShadow);
+                for (int i = 0; i < strips; i++) {
+                    StackPane strip = pageStrip(oldView.getImage(), half + i * stripW, stripW, h, true);
+                    strip.setLayoutX(half + i * stripW);
+                    strip.setLayoutY(0);
+                    strip.setRotationAxis(Rotate.Y_AXIS);
+                    strip.getTransforms().add(new Shear(0.0, -0.018, 0, h / 2.0));
+                    transitionOverlay.getChildren().add(strip);
 
-                RotateTransition flipRot = new RotateTransition(Duration.millis(520), flipping);
-                flipRot.setFromAngle(0);
-                flipRot.setToAngle(-78);
-                flipRot.setInterpolator(paperEase);
-                TranslateTransition flipMove = new TranslateTransition(Duration.millis(520), flipping);
-
-                moveX = -half * 0.72;
+                    double targetX = half - ((strips - i) * stripW * 0.94);
+                    double delay = (strips - 1 - i) * 11.0;
+                    moveX = targetX - strip.getLayoutX();
+                    animations.add(stripCurl(strip, moveX, -82, 0.38, delay, paperEase));
+                }
                 LOG.info("moveX=" + moveX);
-                flipMove.setToX(moveX);
-                flipMove.setInterpolator(paperEase);
-                ScaleTransition flipScale = new ScaleTransition(Duration.millis(520), flipping);
-                flipScale.setToX(0.34);
-                flipScale.setToY(0.985);
-                flipScale.setInterpolator(paperEase);
-                FadeTransition movingFade = new FadeTransition(Duration.millis(520), movingShadow);
-                movingFade.setFromValue(0.72);
-                movingFade.setToValue(0.08);
-                FadeTransition edgeFade = new FadeTransition(Duration.millis(360), edgeLight);
-                edgeFade.setFromValue(0.85);
-                edgeFade.setToValue(0.0);
                 FadeTransition reveal = new FadeTransition(Duration.millis(430), newRight);
                 reveal.setDelay(Duration.millis(80));
                 reveal.setFromValue(0.0);
                 reveal.setToValue(1.0);
-                Timeline shape = pagePerspectiveTimeline(pageShape, half, h, true);
-                Timeline shadowMove = movingShadowTimeline(movingShadow, edgeLight, half, true);
-
-                ParallelTransition pt = new ParallelTransition(flipRot, flipMove, flipScale, movingFade, edgeFade, reveal, shape, shadowMove);
+                animations.add(reveal);
+                ParallelTransition pt = new ParallelTransition(animations.toArray(new Animation[0]));
                 pt.setOnFinished(e -> endTurnAnimation());
                 pt.play();
                 return;
             }
 
-            StackPane flipping = new StackPane(oldLeft, movingShadow, edgeLight);
-            flipping.setManaged(false);
-            flipping.setLayoutX(0);
-            flipping.setLayoutY(0);
-            flipping.setPrefSize(half, h);
-            flipping.setRotationAxis(Rotate.Y_AXIS);
-            flipping.getTransforms().add(new Shear(0.0, 0.025, half, h / 2.0));
-            PerspectiveTransform pageShape = pagePerspective(half, h);
-            flipping.setEffect(pageShape);
             newLeft.setOpacity(0.0);
-            transitionOverlay.getChildren().setAll(newLeft, newRight, oldRight, gutterShadow, flipping);
+            transitionOverlay.getChildren().setAll(newLeft, newRight, oldRight, gutterShadow);
+            for (int i = 0; i < strips; i++) {
+                StackPane strip = pageStrip(oldView.getImage(), i * stripW, stripW, h, false);
+                strip.setLayoutX(i * stripW);
+                strip.setLayoutY(0);
+                strip.setRotationAxis(Rotate.Y_AXIS);
+                strip.getTransforms().add(new Shear(0.0, 0.018, stripW, h / 2.0));
+                transitionOverlay.getChildren().add(strip);
 
-            RotateTransition flipRot = new RotateTransition(Duration.millis(520), flipping);
-            flipRot.setFromAngle(0);
-            flipRot.setToAngle(78);
-            flipRot.setInterpolator(paperEase);
-            TranslateTransition flipMove = new TranslateTransition(Duration.millis(520), flipping);
-
-            moveX = half + (half * 0.72);
+                double targetX = half + ((strips - 1 - i) * stripW * 0.94);
+                double delay = i * 11.0;
+                moveX = targetX - strip.getLayoutX();
+                animations.add(stripCurl(strip, moveX, 82, 0.38, delay, paperEase));
+            }
             LOG.info("moveX=" + moveX);
-            flipMove.setToX(moveX);
-            flipMove.setInterpolator(paperEase);
-            ScaleTransition flipScale = new ScaleTransition(Duration.millis(520), flipping);
-            flipScale.setToX(0.34);
-            flipScale.setToY(0.985);
-            flipScale.setInterpolator(paperEase);
-            FadeTransition movingFade = new FadeTransition(Duration.millis(520), movingShadow);
-            movingFade.setFromValue(0.72);
-            movingFade.setToValue(0.08);
-            FadeTransition edgeFade = new FadeTransition(Duration.millis(360), edgeLight);
-            edgeFade.setFromValue(0.85);
-            edgeFade.setToValue(0.0);
             FadeTransition reveal = new FadeTransition(Duration.millis(430), newLeft);
             reveal.setDelay(Duration.millis(80));
             reveal.setFromValue(0.0);
             reveal.setToValue(1.0);
-            Timeline shape = pagePerspectiveTimeline(pageShape, half, h, false);
-            Timeline shadowMove = movingShadowTimeline(movingShadow, edgeLight, half, false);
-
-            ParallelTransition pt = new ParallelTransition(flipRot, flipMove, flipScale, movingFade, edgeFade, reveal, shape, shadowMove);
+            animations.add(reveal);
+            ParallelTransition pt = new ParallelTransition(animations.toArray(new Animation[0]));
             pt.setOnFinished(e -> endTurnAnimation());
             pt.play();
+        }
+
+        private StackPane pageStrip(Image img, double sourceX, double stripW, double h, boolean forward) {
+            ImageView slice = halfView(img, sourceX, stripW + 1, h);
+            Rectangle shade = new Rectangle(Math.max(1, stripW + 1), h);
+            shade.setMouseTransparent(true);
+            shade.setFill(new LinearGradient(
+                0, 0, 1, 0, true, CycleMethod.NO_CYCLE,
+                forward
+                    ? new Stop[]{new Stop(0, Color.color(0, 0, 0, 0.30)), new Stop(0.55, Color.color(0, 0, 0, 0.04)), new Stop(1, Color.color(1, 1, 1, 0.22))}
+                    : new Stop[]{new Stop(0, Color.color(1, 1, 1, 0.22)), new Stop(0.45, Color.color(0, 0, 0, 0.04)), new Stop(1, Color.color(0, 0, 0, 0.30))}
+            ));
+            Rectangle edge = new Rectangle(2, h);
+            edge.setMouseTransparent(true);
+            edge.setFill(Color.color(1, 1, 1, 0.45));
+            StackPane strip = new StackPane(slice, shade, edge);
+            strip.setManaged(false);
+            strip.setPrefSize(stripW + 1, h);
+            strip.setMaxSize(stripW + 1, h);
+            StackPane.setAlignment(edge, forward ? Pos.CENTER_LEFT : Pos.CENTER_RIGHT);
+            return strip;
+        }
+
+        private Animation stripCurl(StackPane strip, double moveX, double angle, double scaleX, double delayMs, Interpolator paperEase) {
+            RotateTransition rot = new RotateTransition(Duration.millis(560), strip);
+            rot.setDelay(Duration.millis(delayMs));
+            rot.setFromAngle(0);
+            rot.setToAngle(angle);
+            rot.setInterpolator(paperEase);
+
+            TranslateTransition move = new TranslateTransition(Duration.millis(560), strip);
+            move.setDelay(Duration.millis(delayMs));
+            move.setToX(moveX);
+            move.setInterpolator(paperEase);
+
+            ScaleTransition scale = new ScaleTransition(Duration.millis(560), strip);
+            scale.setDelay(Duration.millis(delayMs));
+            scale.setToX(scaleX);
+            scale.setToY(0.985);
+            scale.setInterpolator(paperEase);
+
+            FadeTransition fade = new FadeTransition(Duration.millis(260), strip);
+            fade.setDelay(Duration.millis(delayMs + 300));
+            fade.setFromValue(1.0);
+            fade.setToValue(0.12);
+
+            return new ParallelTransition(rot, move, scale, fade);
         }
 
         private PerspectiveTransform pagePerspective(double half, double h) {
@@ -1089,6 +1083,29 @@ public class MainWindow {
             highlightOverlay.setVisible(true);
             annotation.setVisible(true);
             turnAnimating = false;
+            updateNavButtons();
+        }
+
+        private void updateNavButtons() {
+            if (firstBtn == null || prevBtn == null || nextBtn == null || lastBtn == null) return;
+            try {
+                int total = reader.totalPages();
+                firstBtn.setDisable(turnAnimating || currentPage <= 1);
+                prevBtn.setDisable(turnAnimating || currentPage <= 1);
+                nextBtn.setDisable(turnAnimating || currentPage >= lastSpreadStart(total));
+                lastBtn.setDisable(turnAnimating || currentPage >= lastSpreadStart(total));
+            } catch (Exception ex) {
+                firstBtn.setDisable(turnAnimating || currentPage <= 1);
+                prevBtn.setDisable(turnAnimating || currentPage <= 1);
+                nextBtn.setDisable(turnAnimating);
+                lastBtn.setDisable(turnAnimating);
+            }
+        }
+
+        private void updatePageJumpText() {
+            if (pageJump != null && !pageJump.isFocused()) {
+                pageJump.setText(String.valueOf(currentPage));
+            }
         }
 
         private void zoomIn() {
@@ -1465,6 +1482,8 @@ public class MainWindow {
             try {
                 int total = reader.totalPages();
                 store.upsertProgress(item.ebookId(), currentPage);
+                updatePageJumpText();
+                updateNavButtons();
                 right.setVisible(true);
                 if (currentPage <= 1) {
                     left.setImage(null);
