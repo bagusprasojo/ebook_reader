@@ -89,19 +89,21 @@ public class BackendApiClient {
                     o.get("device_hash").getAsString(),
                     o.get("device_name").getAsString(),
                     o.get("os_version").getAsString(),
-                    o.get("app_version").getAsString()
+                    o.get("app_version").getAsString(),
+                    o.has("public_key_pem") && !o.get("public_key_pem").isJsonNull() ? o.get("public_key_pem").getAsString() : ""
                 ));
             });
             return out;
         }
     }
 
-    public DeviceInfo registerDevice(String accessToken, String deviceHash, String deviceName, String osVersion, String appVersion) throws IOException {
+    public DeviceInfo registerDevice(String accessToken, String deviceHash, String deviceName, String osVersion, String appVersion, String publicKeyPem) throws IOException {
         JsonObject payload = new JsonObject();
         payload.addProperty("device_hash", deviceHash);
         payload.addProperty("device_name", deviceName);
         payload.addProperty("os_version", osVersion);
         payload.addProperty("app_version", appVersion);
+        payload.addProperty("public_key_pem", publicKeyPem);
 
         Request req = new Request.Builder()
             .url(config.baseUrl() + "/api/device/register")
@@ -119,7 +121,8 @@ public class BackendApiClient {
                 o.get("device_hash").getAsString(),
                 o.get("device_name").getAsString(),
                 o.get("os_version").getAsString(),
-                o.get("app_version").getAsString()
+                o.get("app_version").getAsString(),
+                o.has("public_key_pem") && !o.get("public_key_pem").isJsonNull() ? o.get("public_key_pem").getAsString() : ""
             );
         }
     }

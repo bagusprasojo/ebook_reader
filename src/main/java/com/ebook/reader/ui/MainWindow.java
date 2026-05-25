@@ -4,6 +4,7 @@ import com.ebook.reader.api.BackendApiClient;
 import com.ebook.reader.api.PackageDownloader;
 import com.ebook.reader.config.AppConfig;
 import com.ebook.reader.config.ConfigLoader;
+import com.ebook.reader.crypto.DeviceKeyStore;
 import com.ebook.reader.crypto.LocalBookReader;
 import com.ebook.reader.crypto.PackageCryptoService;
 import com.ebook.reader.model.*;
@@ -36,11 +37,14 @@ import javafx.scene.paint.LinearGradient;
 import javafx.scene.paint.Stop;
 import javafx.scene.paint.Color;
 import javafx.scene.input.ScrollEvent;
+import javafx.scene.text.TextAlignment;
 import javafx.util.Duration;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.security.MessageDigest;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -51,8 +55,10 @@ public class MainWindow {
     private BackendApiClient api;
     private PackageDownloader downloader;
     private SessionTokens tokens;
+    private String loggedInEmail = "offline-user";
     private final Path appDataRoot = Paths.get(System.getProperty("user.home"), ".ebook-reader");
     private final Path packagesRoot = appDataRoot.resolve("packages");
+    private final DeviceKeyStore deviceKeyStore = new DeviceKeyStore(appDataRoot);
     private final SQLiteStore store = new SQLiteStore(appDataRoot.resolve("reader.db"));
     private final Label status = new Label("Ready");
     private final TabPane mdiTabs = new TabPane();
@@ -174,6 +180,7 @@ public class MainWindow {
                 try {
                     LOG.info("Login start email=" + email.getText().trim());
                     tokens = api.login(email.getText().trim(), pass.getText());
+                    loggedInEmail = email.getText().trim();
                     LOG.info("Login success");
                     status.setText("Login success");
                 } catch (Exception ex) {
@@ -214,8 +221,11 @@ public class MainWindow {
 
     private int resolveDeviceId(String accessToken) throws Exception {
         String deviceHash = computeDeviceHash();
-        for (DeviceInfo d : api.listDevices(accessToken)) if (deviceHash.equals(d.deviceHash())) return d.id();
-        DeviceInfo created = api.registerDevice(accessToken, deviceHash, System.getProperty("user.name"), System.getProperty("os.name"), "0.1.0");
+        String publicKeyPem = deviceKeyStore.publicKeyPem();
+        for (DeviceInfo d : api.listDevices(accessToken)) {
+            if (deviceHash.equals(d.deviceHash()) && publicKeyPem.equals(d.publicKeyPem())) return d.id();
+        }
+        DeviceInfo created = api.registerDevice(accessToken, deviceHash, System.getProperty("user.name"), System.getProperty("os.name"), "0.1.0", publicKeyPem);
         return created.id();
     }
 
@@ -240,17 +250,10 @@ public class MainWindow {
                 mdiTabs.getSelectionModel().select(existing);
                 return;
             }
-            String keyB64 = config.masterKeyB64();
-            if (keyB64 == null || keyB64.isBlank()) keyB64 = System.getenv("READER_MASTER_KEY_B64");
-            if (keyB64 == null || keyB64.isBlank()) {
-                LOG.warning("Open reader blocked: missing master key");
-                status.setText("Master key belum di-set di config/env");
-                return;
-            }
-            LocalBookReader reader = new LocalBookReader(Path.of(item.packagePath()), Base64.getDecoder().decode(keyB64));
+            LocalBookReader reader = new LocalBookReader(Path.of(item.packagePath()), legacyMasterKeyOrNull(), computeDeviceHash(), deviceKeyStore.privateKey());
             reader.verify(new PackageCryptoService(), PackageCryptoService.readResourceText("/keys/public_key.pem"));
             LOG.info("Open reader verify success ebookId=" + item.ebookId());
-            ReaderPane pane = new ReaderPane(item, reader, status, store, startPage);
+            ReaderPane pane = new ReaderPane(item, reader, status, store, startPage, watermarkIdentity());
             Tab tab = new Tab("Baca: " + item.title(), pane.build());
             tab.setOnClosed(e -> openedReaderTabs.remove(item.ebookId()));
             openedReaderTabs.put(item.ebookId(), tab);
@@ -271,6 +274,17 @@ public class MainWindow {
             renderHome();
         } catch (Exception ex) {
             status.setText("Refresh koleksi gagal: " + ex.getMessage());
+        }
+    }
+
+    private String[] watermarkIdentity() {
+        String userPart = (loggedInEmail == null || loggedInEmail.isBlank()) ? "offline-user" : loggedInEmail;
+        try {
+            String hash = computeDeviceHash();
+            String shortHash = hash.length() > 10 ? hash.substring(0, 10) : hash;
+            return new String[] { userPart, "device " + shortHash };
+        } catch (Exception ex) {
+            return new String[] { userPart, "device unknown" };
         }
     }
 
@@ -380,10 +394,7 @@ public class MainWindow {
         Image cached = homeCoverCache.get(b.ebookId());
         if (cached != null) return cached;
         try {
-            String keyB64 = config.masterKeyB64();
-            if (keyB64 == null || keyB64.isBlank()) keyB64 = System.getenv("READER_MASTER_KEY_B64");
-            if (keyB64 == null || keyB64.isBlank()) return null;
-            LocalBookReader lr = new LocalBookReader(Path.of(b.packagePath()), Base64.getDecoder().decode(keyB64));
+            LocalBookReader lr = new LocalBookReader(Path.of(b.packagePath()), legacyMasterKeyOrNull(), computeDeviceHash(), deviceKeyStore.privateKey());
             Image img = lr.renderPageImage(1);
             if (img != null) {
                 homeCoverCache.put(b.ebookId(), img);
@@ -393,6 +404,13 @@ public class MainWindow {
             LOG.log(Level.FINE, "Cover load failed ebookId=" + b.ebookId(), ex);
             return null;
         }
+    }
+
+    private byte[] legacyMasterKeyOrNull() {
+        String keyB64 = config.masterKeyB64();
+        if (keyB64 == null || keyB64.isBlank()) keyB64 = System.getenv("READER_MASTER_KEY_B64");
+        if (keyB64 == null || keyB64.isBlank()) return null;
+        return Base64.getDecoder().decode(keyB64);
     }
 
     private void showConfigDialog() {
@@ -410,12 +428,14 @@ public class MainWindow {
         private final LocalBookReader reader;
         private final Label status;
         private final SQLiteStore store;
+        private final String[] watermarkIdentity;
         private int currentPage = 1;
         private boolean spreadMode = true; // fixed to spread mode
         private final ImageView left = new ImageView();
         private final ImageView right = new ImageView();
         private final HBox pages = new HBox(8, left, right);
         private final Canvas annotation = new Canvas(980, 620);
+        private final Canvas watermark = new Canvas(980, 620);
         private StackPane pageLayer;
         private final Pane transitionOverlay = new Pane();
         private ScrollPane pageScroll;
@@ -453,11 +473,12 @@ public class MainWindow {
         private double selStartX = -1;
         private double selStartY = -1;
 
-        private ReaderPane(LocalLibraryItem item, LocalBookReader reader, Label status, SQLiteStore store, int startPage) {
+        private ReaderPane(LocalLibraryItem item, LocalBookReader reader, Label status, SQLiteStore store, int startPage, String[] watermarkIdentity) {
             this.item = item;
             this.reader = reader;
             this.status = status;
             this.store = store;
+            this.watermarkIdentity = watermarkIdentity;
             this.currentPage = Math.max(1, startPage);
         }
 
@@ -465,6 +486,8 @@ public class MainWindow {
             left.setPreserveRatio(true); right.setPreserveRatio(true); left.setFitWidth(470); right.setFitWidth(470);
             pages.setAlignment(Pos.CENTER);
             highlightOverlay.setPickOnBounds(false);
+            watermark.setManaged(false);
+            watermark.setMouseTransparent(true);
             transitionOverlay.setPickOnBounds(false);
             transitionOverlay.setMouseTransparent(true);
             transitionOverlay.setManaged(false);
@@ -473,7 +496,7 @@ public class MainWindow {
             selectionRect.setManaged(false);
             selectionRect.setMouseTransparent(true);
             selectionRect.setVisible(false);
-            pageLayer = new StackPane(pages, highlightOverlay, annotation, selectionRect, transitionOverlay);
+            pageLayer = new StackPane(pages, highlightOverlay, watermark, annotation, selectionRect, transitionOverlay);
             pageLayer.getTransforms().add(zoomTransform);
             pageLayer.setAlignment(Pos.TOP_CENTER);
             pageScroll = new ScrollPane(new Group(pageLayer));
@@ -747,6 +770,7 @@ public class MainWindow {
 
                 pages.setVisible(false);
                 highlightOverlay.setVisible(false);
+                watermark.setVisible(false);
                 annotation.setVisible(false);
                 selectionRect.setVisible(false);
 
@@ -754,6 +778,7 @@ public class MainWindow {
             } catch (Exception ex) {
                 pages.setVisible(true);
                 highlightOverlay.setVisible(true);
+                watermark.setVisible(true);
                 annotation.setVisible(true);
                 transitionOverlay.getChildren().clear();
                 turnAnimating = false;
@@ -1081,6 +1106,7 @@ public class MainWindow {
             transitionOverlay.getChildren().clear();
             pages.setVisible(true);
             highlightOverlay.setVisible(true);
+            watermark.setVisible(true);
             annotation.setVisible(true);
             turnAnimating = false;
             updateNavButtons();
@@ -1137,6 +1163,7 @@ public class MainWindow {
             zoomTransform.setY(zoomScale);
             zoomLabel.setText((int)Math.round(zoomScale * 100) + "%");
             selectionRect.setVisible(false);
+            redrawWatermark();
             redrawAnnotations();
             redrawHighlights();
         }
@@ -1488,6 +1515,7 @@ public class MainWindow {
                 if (currentPage <= 1) {
                     left.setImage(null);
                     right.setImage(reader.renderPageImage(1));
+                    redrawWatermark();
                     redrawAnnotations();
                     redrawHighlights();
                     applyZoom();
@@ -1497,6 +1525,7 @@ public class MainWindow {
                 int rightPage = Math.min(currentPage + 1, total);
                 left.setImage(reader.renderPageImage(leftPage));
                 right.setImage(rightPage <= total ? reader.renderPageImage(rightPage) : null);
+                redrawWatermark();
                 redrawAnnotations();
                 redrawHighlights();
                 applyZoom();
@@ -1516,6 +1545,34 @@ public class MainWindow {
                 }
             } catch (Exception ex) {
                 status.setText("Gagal render annotation: " + ex.getMessage());
+            }
+        }
+
+        private void redrawWatermark() {
+            try {
+                double w = Math.max(1, pageLayer == null ? watermark.getWidth() : pageLayer.getWidth());
+                double h = Math.max(1, pageLayer == null ? watermark.getHeight() : pageLayer.getHeight());
+                watermark.setWidth(w);
+                watermark.setHeight(h);
+                GraphicsContext gc = watermark.getGraphicsContext2D();
+                gc.clearRect(0, 0, w, h);
+                gc.save();
+                gc.setGlobalAlpha(0.13);
+                gc.setFill(Color.rgb(30, 30, 30));
+                gc.setFont(javafx.scene.text.Font.font("SansSerif", 18));
+                gc.setTextAlign(TextAlignment.CENTER);
+                String ts = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"));
+                gc.rotate(-28);
+                for (double y = -h; y < h * 2; y += 120) {
+                    for (double x = -w; x < w * 2; x += 360) {
+                        gc.fillText(watermarkIdentity[0], x, y);
+                        gc.fillText(watermarkIdentity[1], x, y + 24);
+                        gc.fillText(ts, x, y + 48);
+                    }
+                }
+                gc.restore();
+            } catch (Exception ex) {
+                LOG.log(Level.FINE, "Watermark render failed", ex);
             }
         }
 

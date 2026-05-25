@@ -8,6 +8,7 @@ import javafx.scene.image.Image;
 
 import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
+import java.security.PrivateKey;
 import java.util.ArrayList;
 import java.util.List;
 import java.nio.file.Path;
@@ -19,11 +20,15 @@ public class LocalBookReader {
     private static final Pattern WORD_PATTERN = Pattern.compile("\\S+");
     private final PackageCryptoService crypto = new PackageCryptoService();
     private final Path packagePath;
-    private final byte[] masterKey;
+    private final byte[] legacyMasterKey;
+    private final String deviceHash;
+    private final PrivateKey devicePrivateKey;
 
-    public LocalBookReader(Path packagePath, byte[] masterKey) {
+    public LocalBookReader(Path packagePath, byte[] legacyMasterKey, String deviceHash, PrivateKey devicePrivateKey) {
         this.packagePath = packagePath;
-        this.masterKey = masterKey;
+        this.legacyMasterKey = legacyMasterKey;
+        this.deviceHash = deviceHash;
+        this.devicePrivateKey = devicePrivateKey;
     }
 
     public int totalPages() throws Exception {
@@ -35,7 +40,14 @@ public class LocalBookReader {
 
     public void verify(PackageCryptoService cryptoService, String publicKeyPem) throws Exception {
         try (ZipFile zf = new ZipFile(packagePath.toFile())) {
-            cryptoService.verifyManifestSignature(zf, PackageCryptoService.loadPublicKeyPem(publicKeyPem));
+            var publicKey = PackageCryptoService.loadPublicKeyPem(publicKeyPem);
+            cryptoService.verifyManifestSignature(zf, publicKey);
+            JsonObject manifest = cryptoService.loadManifest(zf);
+            cryptoService.verifyEntryHashes(zf, manifest);
+            if (manifestVersion(manifest) >= 2) {
+                cryptoService.verifyLicenseSignature(zf, publicKey);
+                resolveContentKey(zf, manifest);
+            }
         }
     }
 
@@ -43,7 +55,7 @@ public class LocalBookReader {
         try (ZipFile zf = new ZipFile(packagePath.toFile())) {
             String path = "pages/p" + page + ".img";
             byte[] blob = PackageCryptoService.readZipEntry(zf, path);
-            byte[] key = crypto.derivePageKey(masterKey, page);
+            byte[] key = crypto.derivePageKey(resolveContentKey(zf, crypto.loadManifest(zf)), page);
             byte[] raw = crypto.decryptPageBlob(blob, key);
             return new Image(new ByteArrayInputStream(raw));
         }
@@ -53,10 +65,42 @@ public class LocalBookReader {
         try (ZipFile zf = new ZipFile(packagePath.toFile())) {
             String path = "text/p" + page + ".txt";
             byte[] blob = PackageCryptoService.readZipEntry(zf, path);
-            byte[] key = crypto.derivePageKey(masterKey, page);
+            byte[] key = crypto.derivePageKey(resolveContentKey(zf, crypto.loadManifest(zf)), page);
             byte[] raw = crypto.decryptPageBlob(blob, key);
             return new String(raw, StandardCharsets.UTF_8);
         }
+    }
+
+    private int manifestVersion(JsonObject manifest) {
+        if (manifest.has("package_format_version")) return manifest.get("package_format_version").getAsInt();
+        if (manifest.has("version")) return manifest.get("version").getAsInt();
+        return 1;
+    }
+
+    private byte[] resolveContentKey(ZipFile zf, JsonObject manifest) throws Exception {
+        if (manifestVersion(manifest) < 2) {
+            if (legacyMasterKey == null || legacyMasterKey.length == 0) {
+                throw new SecurityException("Legacy package requires drm.masterKeyB64");
+            }
+            return legacyMasterKey;
+        }
+        JsonObject license = JsonParser.parseString(
+            new String(PackageCryptoService.readZipEntry(zf, "license.json"), StandardCharsets.UTF_8)
+        ).getAsJsonObject();
+        if (!license.has("device_hash") || !license.get("device_hash").getAsString().equals(deviceHash)) {
+            throw new SecurityException("License device mismatch");
+        }
+        if (!license.has("ebook_id") || license.get("ebook_id").getAsInt() != manifest.get("ebook_id").getAsInt()) {
+            throw new SecurityException("License ebook mismatch");
+        }
+        String alg = license.has("key_wrap_alg") ? license.get("key_wrap_alg").getAsString() : "";
+        if (alg.startsWith("RSA-OAEP")) {
+            if (devicePrivateKey == null) {
+                throw new SecurityException("Device private key missing");
+            }
+            return crypto.unwrapContentKeyWithPrivateKey(license.get("wrapped_content_key").getAsString(), devicePrivateKey);
+        }
+        return crypto.unwrapContentKey(license.get("wrapped_content_key").getAsString(), deviceHash);
     }
 
     public PageTextMap readPageTextMap(int page) throws Exception {

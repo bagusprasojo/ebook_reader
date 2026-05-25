@@ -1,3 +1,3 @@
 package com.ebook.reader.model;
 
-public record DeviceInfo(int id, String deviceHash, String deviceName, String osVersion, String appVersion) {}
+public record DeviceInfo(int id, String deviceHash, String deviceName, String osVersion, String appVersion, String publicKeyPem) {}
