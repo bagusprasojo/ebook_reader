@@ -40,6 +40,7 @@ import javafx.scene.input.ScrollEvent;
 import javafx.scene.text.TextAlignment;
 import javafx.util.Duration;
 
+import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.security.MessageDigest;
@@ -48,6 +49,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.zip.ZipFile;
 
 public class MainWindow {
     private static final Logger LOG = Logger.getLogger(MainWindow.class.getName());
@@ -181,8 +183,9 @@ public class MainWindow {
                     LOG.info("Login start email=" + email.getText().trim());
                     tokens = api.login(email.getText().trim(), pass.getText());
                     loggedInEmail = email.getText().trim();
-                    LOG.info("Login success");
-                    status.setText("Login success");
+                    int deviceId = resolveDeviceId(tokens.access());
+                    LOG.info("Login success deviceId=" + deviceId);
+                    status.setText("Login success. Device active: " + deviceId);
                 } catch (Exception ex) {
                     LOG.log(Level.WARNING, "Login failed", ex);
                     status.setText("Login failed: " + ex.getMessage());
@@ -394,6 +397,18 @@ public class MainWindow {
         Image cached = homeCoverCache.get(b.ebookId());
         if (cached != null) return cached;
         try {
+            try (ZipFile zf = new ZipFile(Path.of(b.packagePath()).toFile())) {
+                byte[] thumb = PackageCryptoService.readZipEntry(zf, "thumb/cover.png");
+                Image img = new Image(new ByteArrayInputStream(thumb));
+                if (!img.isError()) {
+                    homeCoverCache.put(b.ebookId(), img);
+                    return img;
+                }
+            }
+        } catch (Exception ex) {
+            LOG.log(Level.FINE, "Cover thumbnail load failed ebookId=" + b.ebookId(), ex);
+        }
+        try {
             LocalBookReader lr = new LocalBookReader(Path.of(b.packagePath()), legacyMasterKeyOrNull(), computeDeviceHash(), deviceKeyStore.privateKey());
             Image img = lr.renderPageImage(1);
             if (img != null) {
@@ -444,6 +459,7 @@ public class MainWindow {
         private final List<List<Double>> currentStroke = new ArrayList<>();
         private final ListView<BookmarkItem> bookmarkList = new ListView<>();
         private final ListView<NoteItem> noteList = new ListView<>();
+        private final ListView<TocItem> tocList = new ListView<>();
         private final ListView<AnnotationPageItem> annotationList = new ListView<>();
         private final ListView<HighlightPageItem> highlightList = new ListView<>();
         private final TextField noteFilter = new TextField();
@@ -671,6 +687,25 @@ public class MainWindow {
             noteFilter.setPromptText("Filter notes (title/content/page)");
             noteFilter.textProperty().addListener((obs, oldVal, newVal) -> applyNoteFilter());
 
+            tocList.setCellFactory(ignored -> new ListCell<>() {
+                @Override
+                protected void updateItem(TocItem toc, boolean empty) {
+                    super.updateItem(toc, empty);
+                    if (empty || toc == null) {
+                        setText("");
+                    } else {
+                        String indent = "  ".repeat(Math.max(0, toc.level() - 1));
+                        setText(indent + "p" + toc.page() + " - " + toc.title());
+                    }
+                }
+            });
+            tocList.setOnMouseClicked(ev -> {
+                if (ev.getButton() == MouseButton.PRIMARY && ev.getClickCount() == 2) {
+                    TocItem toc = tocList.getSelectionModel().getSelectedItem();
+                    if (toc != null) jumpToPage(toc.page());
+                }
+            });
+            Tab tocTab = new Tab("TOC", new VBox(6, tocList)); tocTab.setClosable(false);
             Tab bmTab = new Tab("Bookmarks", new VBox(6, bookmarkList)); bmTab.setClosable(false);
             notePreviewContent.setEditable(false);
             notePreviewContent.setWrapText(true);
@@ -723,13 +758,14 @@ public class MainWindow {
             });
             annotationList.setContextMenu(buildAnnotationContextMenu());
             Tab anTab = new Tab("Annotations", new VBox(6, annotationList)); anTab.setClosable(false);
-            TabPane side = new TabPane(bmTab, ntTab, hiTab, anTab);
+            TabPane side = new TabPane(tocTab, bmTab, ntTab, hiTab, anTab);
             side.setMinWidth(300);
             side.setPrefWidth(300);
             side.setMaxWidth(300);
             side.setPadding(new Insets(0, 0, 0, 8));
             HBox content = new HBox(8, pageScroll, side); HBox.setHgrow(pageScroll, Priority.ALWAYS);
             VBox root = new VBox(4, controls, content); root.setPadding(new Insets(6));
+            reloadToc();
             reloadBookmarks();
             reloadNotes();
             reloadHighlights();
@@ -1216,6 +1252,14 @@ public class MainWindow {
             if (d.showAndWait().orElse(ButtonType.CANCEL) == save) {
                 if (content.getText().trim().isEmpty()) { status.setText("Isi note tidak boleh kosong"); return; }
                 try { store.addNote(item.ebookId(), currentPage, title.getText().trim(), content.getText().trim()); LOG.info("Note saved ebookId=" + item.ebookId() + " page=" + currentPage); reloadNotes(); } catch (Exception ex) { LOG.log(Level.WARNING, "Note save failed", ex); status.setText("Gagal simpan note: " + ex.getMessage()); }
+            }
+        }
+
+        private void reloadToc() {
+            try {
+                tocList.getItems().setAll(reader.readToc());
+            } catch (Exception ex) {
+                status.setText("Gagal load TOC: " + ex.getMessage());
             }
         }
 

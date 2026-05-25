@@ -4,6 +4,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
+import com.ebook.reader.model.TocItem;
 import javafx.scene.image.Image;
 
 import java.io.ByteArrayInputStream;
@@ -139,6 +140,26 @@ public class LocalBookReader {
             });
         });
         return new PageTextMap(width, height, spans);
+    }
+
+    public List<TocItem> readToc() throws Exception {
+        try (ZipFile zf = new ZipFile(packagePath.toFile())) {
+            if (zf.getEntry("metadata/toc.json") == null) {
+                return List.of();
+            }
+            String raw = new String(PackageCryptoService.readZipEntry(zf, "metadata/toc.json"), StandardCharsets.UTF_8);
+            JsonArray arr = JsonParser.parseString(raw).getAsJsonArray();
+            List<TocItem> out = new ArrayList<>();
+            arr.forEach(item -> {
+                JsonObject o = item.getAsJsonObject();
+                out.add(new TocItem(
+                    o.has("level") ? o.get("level").getAsInt() : 1,
+                    o.has("title") ? o.get("title").getAsString() : "",
+                    o.has("page") ? o.get("page").getAsInt() : 1
+                ));
+            });
+            return out;
+        }
     }
 
     private List<TextSpanBox> splitSpanToWords(String text, double x, double y, double w, double h) {

@@ -5,6 +5,8 @@ import com.google.gson.JsonParser;
 
 import javax.crypto.Cipher;
 import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.OAEPParameterSpec;
+import javax.crypto.spec.PSource;
 import javax.crypto.spec.SecretKeySpec;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -15,6 +17,7 @@ import java.security.MessageDigest;
 import java.security.PrivateKey;
 import java.security.PublicKey;
 import java.security.Signature;
+import java.security.spec.MGF1ParameterSpec;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.Base64;
 import java.util.Map;
@@ -88,7 +91,13 @@ public class PackageCryptoService {
     public byte[] unwrapContentKeyWithPrivateKey(String wrappedContentKeyB64, PrivateKey privateKey) throws Exception {
         byte[] ciphertext = Base64.getDecoder().decode(wrappedContentKeyB64);
         Cipher cipher = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding");
-        cipher.init(Cipher.DECRYPT_MODE, privateKey);
+        OAEPParameterSpec spec = new OAEPParameterSpec(
+            "SHA-256",
+            "MGF1",
+            MGF1ParameterSpec.SHA256,
+            PSource.PSpecified.DEFAULT
+        );
+        cipher.init(Cipher.DECRYPT_MODE, privateKey, spec);
         return cipher.doFinal(ciphertext);
     }
 
