@@ -786,41 +786,8 @@ public class MainWindow {
             if (turnAnimating) return;
             int target = targetPage(forward);
             if (target == currentPage) return;
-            turnAnimating = true;
-            try {
-                transitionOverlay.getChildren().clear();
-                transitionOverlay.resizeRelocate(0, 0, pageLayer.getWidth(), pageLayer.getHeight());
-                WritableImage oldShot = pageLayer.snapshot(new SnapshotParameters(), null);
-                ImageView oldView = new ImageView(oldShot);
-                oldView.setFitWidth(pageLayer.getWidth());
-                oldView.setFitHeight(pageLayer.getHeight());
-                oldView.setPreserveRatio(false);
-
-                currentPage = target;
-                render();
-                WritableImage newShot = pageLayer.snapshot(new SnapshotParameters(), null);
-                ImageView newView = new ImageView(newShot);
-                newView.setFitWidth(pageLayer.getWidth());
-                newView.setFitHeight(pageLayer.getHeight());
-                newView.setPreserveRatio(false);
-
-                pages.setVisible(false);
-                highlightOverlay.setVisible(false);
-                watermark.setVisible(false);
-                annotation.setVisible(false);
-                selectionRect.setVisible(false);
-
-                playCurlTransition(forward, oldView, newView);
-            } catch (Exception ex) {
-                pages.setVisible(true);
-                highlightOverlay.setVisible(true);
-                watermark.setVisible(true);
-                annotation.setVisible(true);
-                transitionOverlay.getChildren().clear();
-                turnAnimating = false;
-                updateNavButtons();
-                LOG.log(Level.WARNING, "Page turn animation failed", ex);
-            }
+            currentPage = target;
+            render();
         }
 
         private int targetPage(boolean forward) {
