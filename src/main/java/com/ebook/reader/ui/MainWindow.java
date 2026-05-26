@@ -456,6 +456,7 @@ public class MainWindow {
         private ScrollPane pageScroll;
         private final Scale zoomTransform = new Scale(1, 1, 0, 0);
         private final Pane highlightOverlay = new Pane();
+        private final Pane searchOverlay = new Pane();
         private final List<List<Double>> currentStroke = new ArrayList<>();
         private final ListView<BookmarkItem> bookmarkList = new ListView<>();
         private final ListView<NoteItem> noteList = new ListView<>();
@@ -480,6 +481,9 @@ public class MainWindow {
         private Button nextBtn;
         private Button lastBtn;
         private final TextField pageJump = new TextField("1");
+        private final Label searchResultLabel = new Label("0 / 0");
+        private final List<SearchResult> searchResults = new ArrayList<>();
+        private int searchResultIndex = -1;
         private double zoomScale = 1.0;
         private static final double ZOOM_MIN = 1.0;
         private static final double ZOOM_MAX = 3.0;
@@ -502,6 +506,8 @@ public class MainWindow {
             left.setPreserveRatio(true); right.setPreserveRatio(true); left.setFitWidth(470); right.setFitWidth(470);
             pages.setAlignment(Pos.CENTER);
             highlightOverlay.setPickOnBounds(false);
+            searchOverlay.setPickOnBounds(false);
+            searchOverlay.setMouseTransparent(true);
             watermark.setManaged(false);
             watermark.setMouseTransparent(true);
             transitionOverlay.setPickOnBounds(false);
@@ -512,7 +518,7 @@ public class MainWindow {
             selectionRect.setManaged(false);
             selectionRect.setMouseTransparent(true);
             selectionRect.setVisible(false);
-            pageLayer = new StackPane(pages, highlightOverlay, watermark, annotation, selectionRect, transitionOverlay);
+            pageLayer = new StackPane(pages, highlightOverlay, searchOverlay, watermark, annotation, selectionRect, transitionOverlay);
             pageLayer.getTransforms().add(zoomTransform);
             pageLayer.setAlignment(Pos.TOP_CENTER);
             pageScroll = new ScrollPane(new Group(pageLayer));
@@ -623,7 +629,9 @@ public class MainWindow {
             Button zoomOutBtn = new Button("-"); zoomOutBtn.setOnAction(e -> zoomOut());
             Button zoomInBtn = new Button("+"); zoomInBtn.setOnAction(e -> zoomIn());
             TextField search = new TextField(); search.setPromptText("Search text in this book");
-            Button find = new Button("Search"); find.setOnAction(e -> { try { LOG.info("Search start query=" + search.getText()); int found = reader.findFirstPageContaining(search.getText()); if (found > 0) { LOG.info("Search hit page=" + found); currentPage = found; render(); } else { LOG.info("Search no result"); } } catch (Exception ex) { LOG.log(Level.WARNING, "Search failed", ex); status.setText("Search error: " + ex.getMessage()); }});
+            Button find = new Button("Search"); find.setOnAction(e -> performSearch(search.getText()));
+            Button prevResult = new Button("Prev Result"); prevResult.setOnAction(e -> moveSearchResult(-1));
+            Button nextResult = new Button("Next Result"); nextResult.setOnAction(e -> moveSearchResult(1));
             Button bookmark = new Button("Bookmark"); bookmark.setOnAction(e -> addBookmark());
             Button note = new Button("Note"); note.setOnAction(e -> addNote());
             ToggleButton annotationBtn = new ToggleButton("Annotation");
@@ -671,7 +679,7 @@ public class MainWindow {
                 bookmark, note,
                 highlight, hiTools,
                 annotationBtn, annoTools,
-                new Label("Search"), search, find
+                new Label("Search"), search, find, prevResult, nextResult, searchResultLabel
             );
             toolbar.setAlignment(Pos.CENTER_LEFT);
             search.setPrefWidth(180);
@@ -1473,6 +1481,153 @@ public class MainWindow {
             return x1 < x2 + w2 && x1 + w1 > x2 && y1 < y2 + h2 && y1 + h1 > y2;
         }
 
+        private void performSearch(String query) {
+            searchResults.clear();
+            searchResultIndex = -1;
+            redrawSearchHighlights();
+            String q = query == null ? "" : query.trim();
+            if (q.isBlank()) {
+                updateSearchResultLabel();
+                status.setText("Search kosong");
+                return;
+            }
+            try {
+                LOG.info("Search start query=" + q);
+                List<String> tokens = searchTokens(q);
+                int total = reader.totalPages();
+                for (int page = 1; page <= total; page++) {
+                    LocalBookReader.PageTextMap map = reader.readPageTextMap(page);
+                    List<LocalBookReader.TextSpanBox> spans = map.spans();
+                    for (int i = 0; i < spans.size(); i++) {
+                        SearchResult r = matchSearchAt(page, spans, i, tokens);
+                        if (r != null) {
+                            searchResults.add(r);
+                        }
+                    }
+                }
+                if (searchResults.isEmpty()) {
+                    updateSearchResultLabel();
+                    status.setText("Search tidak menemukan hasil");
+                    LOG.info("Search no result query=" + q);
+                    return;
+                }
+                searchResultIndex = 0;
+                goToSearchResult();
+                LOG.info("Search found count=" + searchResults.size() + " query=" + q);
+            } catch (Exception ex) {
+                LOG.log(Level.WARNING, "Search failed", ex);
+                status.setText("Search error: " + ex.getMessage());
+                searchResults.clear();
+                searchResultIndex = -1;
+                updateSearchResultLabel();
+                redrawSearchHighlights();
+            }
+        }
+
+        private List<String> searchTokens(String query) {
+            return Arrays.stream(query.toLowerCase(Locale.ROOT).split("\\s+"))
+                .map(this::normalizeSearchWord)
+                .filter(s -> !s.isBlank())
+                .toList();
+        }
+
+        private String normalizeSearchWord(String text) {
+            if (text == null) return "";
+            return text.toLowerCase(Locale.ROOT).replaceAll("^[\\p{Punct}\\s]+|[\\p{Punct}\\s]+$", "");
+        }
+
+        private SearchResult matchSearchAt(int page, List<LocalBookReader.TextSpanBox> spans, int start, List<String> tokens) {
+            if (tokens.isEmpty() || start + tokens.size() > spans.size()) return null;
+            double x0 = Double.MAX_VALUE;
+            double y0 = Double.MAX_VALUE;
+            double x1 = Double.MIN_VALUE;
+            double y1 = Double.MIN_VALUE;
+            StringBuilder text = new StringBuilder();
+            for (int i = 0; i < tokens.size(); i++) {
+                LocalBookReader.TextSpanBox span = spans.get(start + i);
+                String word = normalizeSearchWord(span.text());
+                String token = tokens.get(i);
+                boolean matched = tokens.size() == 1 ? word.contains(token) : word.equals(token);
+                if (!matched) return null;
+                if (!text.isEmpty()) text.append(" ");
+                text.append(span.text());
+                x0 = Math.min(x0, span.x());
+                y0 = Math.min(y0, span.y());
+                x1 = Math.max(x1, span.x() + span.w());
+                y1 = Math.max(y1, span.y() + span.h());
+            }
+            if (x1 <= x0 || y1 <= y0) return null;
+            return new SearchResult(page, text.toString(), x0, y0, x1 - x0, y1 - y0);
+        }
+
+        private void moveSearchResult(int delta) {
+            if (searchResults.isEmpty()) {
+                updateSearchResultLabel();
+                status.setText("Belum ada hasil search");
+                return;
+            }
+            searchResultIndex = Math.floorMod(searchResultIndex + delta, searchResults.size());
+            goToSearchResult();
+        }
+
+        private void goToSearchResult() {
+            if (searchResultIndex < 0 || searchResultIndex >= searchResults.size()) {
+                updateSearchResultLabel();
+                redrawSearchHighlights();
+                return;
+            }
+            SearchResult r = searchResults.get(searchResultIndex);
+            currentPage = normalizePageForSpread(r.page());
+            render();
+            updateSearchResultLabel();
+            status.setText("Search result " + (searchResultIndex + 1) + " / " + searchResults.size() + " di halaman " + r.page());
+        }
+
+        private void updateSearchResultLabel() {
+            int current = searchResultIndex >= 0 && !searchResults.isEmpty() ? searchResultIndex + 1 : 0;
+            searchResultLabel.setText(current + " / " + searchResults.size());
+        }
+
+        private void redrawSearchHighlights() {
+            searchOverlay.getChildren().clear();
+            if (searchResults.isEmpty()) return;
+            try {
+                if (currentPage <= 1) {
+                    drawSearchHighlightsForPage(1, right.getBoundsInParent());
+                } else {
+                    drawSearchHighlightsForPage(currentPage, left.getBoundsInParent());
+                    drawSearchHighlightsForPage(currentPage + 1, right.getBoundsInParent());
+                }
+            } catch (Exception ex) {
+                LOG.log(Level.WARNING, "Search highlight render failed", ex);
+            }
+        }
+
+        private void drawSearchHighlightsForPage(int page, Bounds b) throws Exception {
+            LocalBookReader.PageTextMap map = reader.readPageTextMap(page);
+            double pw = map.width();
+            double ph = map.height();
+            if (pw <= 0 || ph <= 0) return;
+            double sx = Math.max(1.0, b.getWidth()) / pw;
+            double sy = Math.max(1.0, b.getHeight()) / ph;
+            for (int i = 0; i < searchResults.size(); i++) {
+                SearchResult r = searchResults.get(i);
+                if (r.page() != page) continue;
+                Rectangle box = new Rectangle(
+                    b.getMinX() + r.x() * sx,
+                    b.getMinY() + r.y() * sy,
+                    Math.max(1.0, r.w() * sx),
+                    Math.max(1.0, r.h() * sy)
+                );
+                boolean active = i == searchResultIndex;
+                box.setFill(active ? Color.color(1.0, 0.62, 0.0, 0.42) : Color.color(1.0, 1.0, 0.0, 0.28));
+                box.setStroke(active ? Color.ORANGE : Color.TRANSPARENT);
+                box.setStrokeWidth(active ? 1.5 : 0.0);
+                box.setMouseTransparent(true);
+                searchOverlay.getChildren().add(box);
+            }
+        }
+
         private void redrawHighlights() {
             highlightOverlay.getChildren().clear();
             try {
@@ -1526,20 +1681,22 @@ public class MainWindow {
                 if (currentPage <= 1) {
                     left.setImage(null);
                     right.setImage(reader.renderPageImage(1));
-                    redrawWatermark();
-                    redrawAnnotations();
-                    redrawHighlights();
-                    applyZoom();
-                    return;
-                }
+                redrawWatermark();
+                redrawAnnotations();
+                redrawHighlights();
+                redrawSearchHighlights();
+                applyZoom();
+                return;
+            }
                 int leftPage = Math.min(currentPage, total);
                 int rightPage = Math.min(currentPage + 1, total);
                 left.setImage(reader.renderPageImage(leftPage));
                 right.setImage(rightPage <= total ? reader.renderPageImage(rightPage) : null);
-                redrawWatermark();
-                redrawAnnotations();
-                redrawHighlights();
-                applyZoom();
+            redrawWatermark();
+            redrawAnnotations();
+            redrawHighlights();
+            redrawSearchHighlights();
+            applyZoom();
             } catch (Exception ex) {
                 LOG.log(Level.WARNING, "Render failed", ex);
                 status.setText("Render error: " + ex.getMessage());
@@ -1639,5 +1796,7 @@ public class MainWindow {
             int b = (int)Math.round(c.getBlue() * 255);
             return String.format("#%02x%02x%02x", r, g, b);
         }
+
+        private record SearchResult(int page, String text, double x, double y, double w, double h) {}
     }
 }
