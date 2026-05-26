@@ -9,10 +9,14 @@ import com.ebook.reader.crypto.LocalBookReader;
 import com.ebook.reader.crypto.PackageCryptoService;
 import com.ebook.reader.model.*;
 import com.ebook.reader.storage.SQLiteStore;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import javafx.animation.*;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.geometry.Bounds;
+import javafx.geometry.BoundingBox;
 import javafx.scene.Parent;
 import javafx.scene.Group;
 import javafx.scene.SnapshotParameters;
@@ -445,7 +449,7 @@ public class MainWindow {
         private final SQLiteStore store;
         private final String[] watermarkIdentity;
         private int currentPage = 1;
-        private boolean spreadMode = true; // fixed to spread mode
+        private boolean spreadMode = true;
         private final ImageView left = new ImageView();
         private final ImageView right = new ImageView();
         private final HBox pages = new HBox(8, left, right);
@@ -492,6 +496,7 @@ public class MainWindow {
         private final Rectangle selectionRect = new Rectangle();
         private double selStartX = -1;
         private double selStartY = -1;
+        private int currentStrokePage = -1;
 
         private ReaderPane(LocalLibraryItem item, LocalBookReader reader, Label status, SQLiteStore store, int startPage, String[] watermarkIdentity) {
             this.item = item;
@@ -510,6 +515,7 @@ public class MainWindow {
             searchOverlay.setMouseTransparent(true);
             watermark.setManaged(false);
             watermark.setMouseTransparent(true);
+            annotation.setManaged(false);
             transitionOverlay.setPickOnBounds(false);
             transitionOverlay.setMouseTransparent(true);
             transitionOverlay.setManaged(false);
@@ -521,6 +527,13 @@ public class MainWindow {
             pageLayer = new StackPane(pages, highlightOverlay, searchOverlay, watermark, annotation, selectionRect, transitionOverlay);
             pageLayer.getTransforms().add(zoomTransform);
             pageLayer.setAlignment(Pos.TOP_CENTER);
+            StackPane.setAlignment(pages, Pos.TOP_CENTER);
+            StackPane.setAlignment(highlightOverlay, Pos.TOP_LEFT);
+            StackPane.setAlignment(searchOverlay, Pos.TOP_LEFT);
+            StackPane.setAlignment(watermark, Pos.TOP_LEFT);
+            StackPane.setAlignment(annotation, Pos.TOP_LEFT);
+            StackPane.setAlignment(selectionRect, Pos.TOP_LEFT);
+            StackPane.setAlignment(transitionOverlay, Pos.TOP_LEFT);
             pageScroll = new ScrollPane(new Group(pageLayer));
             pageScroll.setPannable(true);
             pageScroll.setFitToWidth(false);
@@ -581,13 +594,16 @@ public class MainWindow {
                 }
                 if (!annotationMode.isSelected()) return;
                 if (e.getButton() == MouseButton.PRIMARY) {
+                    Point2D p = pageLayer.sceneToLocal(e.getSceneX(), e.getSceneY());
+                    currentStrokePage = pageAtPoint(p.getX(), p.getY());
+                    if (currentStrokePage < 1) return;
                     currentStroke.clear();
                     gc.setStroke(annotationColor.getValue());
                     gc.setLineWidth(annotationThickness.getValue());
                     gc.beginPath();
-                    gc.moveTo(e.getX(), e.getY());
+                    gc.moveTo(p.getX(), p.getY());
                     gc.stroke();
-                    currentStroke.add(List.of(e.getX(), e.getY()));
+                    currentStroke.add(List.of(p.getX(), p.getY()));
                 }
             });
             annotation.setOnMouseDragged(e -> {
@@ -603,9 +619,10 @@ public class MainWindow {
                 }
                 if (!annotationMode.isSelected()) return;
                 if (e.getButton() == MouseButton.PRIMARY) {
-                    gc.lineTo(e.getX(), e.getY());
+                    Point2D p = pageLayer.sceneToLocal(e.getSceneX(), e.getSceneY());
+                    gc.lineTo(p.getX(), p.getY());
                     gc.stroke();
-                    currentStroke.add(List.of(e.getX(), e.getY()));
+                    currentStroke.add(List.of(p.getX(), p.getY()));
                 }
             });
             annotation.setOnMouseReleased(e -> {
@@ -628,6 +645,17 @@ public class MainWindow {
             pageJump.setOnAction(e -> jumpToPageFromInput());
             Button zoomOutBtn = new Button("-"); zoomOutBtn.setOnAction(e -> zoomOut());
             Button zoomInBtn = new Button("+"); zoomInBtn.setOnAction(e -> zoomIn());
+            ToggleButton singlePage = new ToggleButton("Single Page");
+            singlePage.setSelected(!spreadMode);
+            singlePage.setOnAction(e -> {
+                spreadMode = !singlePage.isSelected();
+                zoomScale = 1.0;
+                if (spreadMode) {
+                    currentPage = normalizePageForSpread(currentPage);
+                }
+                LOG.info("Reader page mode=" + (spreadMode ? "spread" : "single"));
+                render();
+            });
             TextField search = new TextField(); search.setPromptText("Search text in this book");
             Button find = new Button("Search"); find.setOnAction(e -> performSearch(search.getText()));
             Button prevResult = new Button("Prev Result"); prevResult.setOnAction(e -> moveSearchResult(-1));
@@ -675,7 +703,7 @@ public class MainWindow {
 
             HBox toolbar = new HBox(6,
                 firstBtn, prevBtn, pageJump, nextBtn, lastBtn,
-                new Label("Zoom"), zoomOutBtn, zoomInBtn, zoomLabel,
+                singlePage, new Label("Zoom"), zoomOutBtn, zoomInBtn, zoomLabel,
                 bookmark, note,
                 highlight, hiTools,
                 annotationBtn, annoTools,
@@ -801,13 +829,17 @@ public class MainWindow {
         private int targetPage(boolean forward) {
             try {
                 int total = reader.totalPages();
+                if (!spreadMode) {
+                    return forward ? Math.min(total, currentPage + 1) : Math.max(1, currentPage - 1);
+                }
                 if (forward) {
                     if (currentPage >= lastSpreadStart(total)) return currentPage;
                     return Math.min(lastSpreadStart(total), currentPage + 2);
                 }
                 return Math.max(1, currentPage - 2);
             } catch (Exception ex) {
-                return forward ? currentPage + 2 : Math.max(1, currentPage - 2);
+                int step = spreadMode ? 2 : 1;
+                return forward ? currentPage + step : Math.max(1, currentPage - step);
             }
         }
 
@@ -835,7 +867,9 @@ public class MainWindow {
             if (turnAnimating) return;
             try {
                 int total = reader.totalPages();
-                int target = Math.min(lastSpreadStart(total), normalizePageForSpread(page));
+                int normalized = spreadMode ? normalizePageForSpread(page) : Math.max(1, page);
+                int max = spreadMode ? lastSpreadStart(total) : total;
+                int target = Math.min(max, normalized);
                 currentPage = target;
                 render();
             } catch (Exception ex) {
@@ -846,7 +880,8 @@ public class MainWindow {
 
         private void jumpToLastPage() {
             try {
-                currentPage = lastSpreadStart(reader.totalPages());
+                int total = reader.totalPages();
+                currentPage = spreadMode ? lastSpreadStart(total) : total;
                 render();
             } catch (Exception ex) {
                 status.setText("Gagal menuju halaman terakhir: " + ex.getMessage());
@@ -1129,8 +1164,9 @@ public class MainWindow {
                 int total = reader.totalPages();
                 firstBtn.setDisable(turnAnimating || currentPage <= 1);
                 prevBtn.setDisable(turnAnimating || currentPage <= 1);
-                nextBtn.setDisable(turnAnimating || currentPage >= lastSpreadStart(total));
-                lastBtn.setDisable(turnAnimating || currentPage >= lastSpreadStart(total));
+                int last = spreadMode ? lastSpreadStart(total) : total;
+                nextBtn.setDisable(turnAnimating || currentPage >= last);
+                lastBtn.setDisable(turnAnimating || currentPage >= last);
             } catch (Exception ex) {
                 firstBtn.setDisable(turnAnimating || currentPage <= 1);
                 prevBtn.setDisable(turnAnimating || currentPage <= 1);
@@ -1159,13 +1195,22 @@ public class MainWindow {
 
         private void applyZoom() {
             Bounds vp = pageScroll.getViewportBounds();
+            double vpW = vp == null ? 1000 : Math.max(200, vp.getWidth() - 10);
             double baseFitHeight = computeBaseFitHeight(vp);
+            resetOverlayBoundsForLayout();
+            if (spreadMode) {
+                left.setFitWidth(0);
+                right.setFitWidth(0);
+            } else {
+                left.setFitWidth(0);
+                right.setFitWidth(vpW);
+            }
             left.setFitHeight(baseFitHeight);
             right.setFitHeight(baseFitHeight);
             if (zoomScale <= 1.0) {
                 zoomScale = 1.0;
-                pageScroll.setHbarPolicy(ScrollPane.ScrollBarPolicy.NEVER);
-                pageScroll.setVbarPolicy(ScrollPane.ScrollBarPolicy.NEVER);
+                pageScroll.setHbarPolicy(spreadMode ? ScrollPane.ScrollBarPolicy.AS_NEEDED : ScrollPane.ScrollBarPolicy.NEVER);
+                pageScroll.setVbarPolicy(spreadMode ? ScrollPane.ScrollBarPolicy.NEVER : ScrollPane.ScrollBarPolicy.AS_NEEDED);
             } else {
                 pageScroll.setHbarPolicy(ScrollPane.ScrollBarPolicy.AS_NEEDED);
                 pageScroll.setVbarPolicy(ScrollPane.ScrollBarPolicy.AS_NEEDED);
@@ -1174,9 +1219,44 @@ public class MainWindow {
             zoomTransform.setY(zoomScale);
             zoomLabel.setText((int)Math.round(zoomScale * 100) + "%");
             selectionRect.setVisible(false);
+            pageLayer.applyCss();
+            pageLayer.layout();
+            pages.applyCss();
+            pages.layout();
+            resizePageOverlays();
+            pageLayer.applyCss();
+            pageLayer.layout();
             redrawWatermark();
             redrawAnnotations();
             redrawHighlights();
+            redrawSearchHighlights();
+        }
+
+        private void resetOverlayBoundsForLayout() {
+            annotation.setWidth(1);
+            annotation.setHeight(1);
+            watermark.setWidth(1);
+            watermark.setHeight(1);
+            highlightOverlay.setPrefSize(1, 1);
+            searchOverlay.setPrefSize(1, 1);
+            transitionOverlay.setPrefSize(1, 1);
+            pageLayer.setPrefSize(Region.USE_COMPUTED_SIZE, Region.USE_COMPUTED_SIZE);
+            pageLayer.setMaxSize(Region.USE_COMPUTED_SIZE, Region.USE_COMPUTED_SIZE);
+        }
+
+        private void resizePageOverlays() {
+            Bounds b = pages.getBoundsInParent();
+            double w = Math.max(1.0, b.getMinX() + b.getWidth());
+            double h = Math.max(1.0, b.getHeight());
+            annotation.setWidth(w);
+            annotation.setHeight(h);
+            watermark.setWidth(w);
+            watermark.setHeight(h);
+            highlightOverlay.setPrefSize(w, h);
+            searchOverlay.setPrefSize(w, h);
+            transitionOverlay.setPrefSize(w, h);
+            pageLayer.setPrefSize(w, h);
+            pageLayer.setMaxSize(w, h);
         }
 
         private double computeBaseFitHeight(Bounds viewport) {
@@ -1186,18 +1266,11 @@ public class MainWindow {
 
             Image li = left.getImage();
             Image ri = right.getImage();
-            if (li == null && ri == null) return hFromHeight;
-            if (li == null && ri != null) {
-                double ratio = safeRatio(ri);
-                return Math.max(120, Math.min(hFromHeight, vpW / ratio));
+            if (!spreadMode) {
+                double ratio = safeRatio(ri != null ? ri : li);
+                return Math.max(120, vpW / ratio);
             }
-
-            double leftRatio = safeRatio(li);
-            double rightRatio = safeRatio(ri != null ? ri : li);
-            double neededW = hFromHeight * leftRatio + hFromHeight * rightRatio + 8.0;
-            if (neededW <= vpW) return hFromHeight;
-            double shrink = vpW / Math.max(1.0, neededW);
-            return Math.max(120, hFromHeight * shrink);
+            return hFromHeight;
         }
 
         private double safeRatio(Image img) {
@@ -1243,16 +1316,140 @@ public class MainWindow {
                 return;
             }
             try {
-                StringBuilder sb = new StringBuilder("{");
-                sb.append("\"color\":\"").append(toHex(annotationColor.getValue())).append("\",");
-                sb.append("\"thickness\":").append(annotationThickness.getValue()).append(",");
-                sb.append("\"points\":[");
-                for (int i = 0; i < currentStroke.size(); i++) { List<Double> p = currentStroke.get(i); sb.append("[").append(p.get(0)).append(",").append(p.get(1)).append("]"); if (i < currentStroke.size() - 1) sb.append(","); }
-                sb.append("]}");
-                store.addAnnotation(item.ebookId(), currentPage, sb.toString());
+                Map<Integer, List<List<List<Double>>>> pathsByPage = splitStrokeByPage();
+                for (Map.Entry<Integer, List<List<List<Double>>>> entry : pathsByPage.entrySet()) {
+                    persistStrokeForPage(entry.getKey(), entry.getValue());
+                }
                 currentStroke.clear();
+                currentStrokePage = -1;
                 reloadAnnotations();
+                redrawAnnotations();
             } catch (Exception ex) { status.setText("Gagal simpan annotation: " + ex.getMessage()); }
+        }
+
+        private Map<Integer, List<List<List<Double>>>> splitStrokeByPage() {
+            LinkedHashMap<Integer, List<List<List<Double>>>> out = new LinkedHashMap<>();
+            try {
+                Map<Integer, Bounds> pageBounds = visiblePageBounds();
+                if (currentStroke.size() == 1) {
+                    List<Double> p = currentStroke.get(0);
+                    int page = pageAtPoint(p.get(0), p.get(1));
+                    if (page > 0) {
+                        List<List<Double>> path = new ArrayList<>();
+                        appendStrokePoint(path, p.get(0), p.get(1));
+                        out.computeIfAbsent(page, ignored -> new ArrayList<>()).add(path);
+                    }
+                    return out;
+                }
+                for (int i = 1; i < currentStroke.size(); i++) {
+                    List<Double> a = currentStroke.get(i - 1);
+                    List<Double> b = currentStroke.get(i);
+                    double x0 = a.get(0);
+                    double y0 = a.get(1);
+                    double x1 = b.get(0);
+                    double y1 = b.get(1);
+                    for (Map.Entry<Integer, Bounds> entry : pageBounds.entrySet()) {
+                        double[] clipped = clipSegmentToBounds(x0, y0, x1, y1, entry.getValue());
+                        if (clipped == null) continue;
+                        List<List<List<Double>>> paths = out.computeIfAbsent(entry.getKey(), ignored -> new ArrayList<>());
+                        List<List<Double>> path = findAppendablePath(paths, clipped[0], clipped[1]);
+                        if (path == null) {
+                            path = new ArrayList<>();
+                            paths.add(path);
+                        }
+                        appendStrokePoint(path, clipped[0], clipped[1]);
+                        appendStrokePoint(path, clipped[2], clipped[3]);
+                    }
+                }
+            } catch (Exception ex) {
+                LOG.log(Level.WARNING, "Annotation stroke split failed", ex);
+            }
+            return out;
+        }
+
+        private List<List<Double>> findAppendablePath(List<List<List<Double>>> paths, double x, double y) {
+            if (paths.isEmpty()) return null;
+            List<List<Double>> lastPath = paths.get(paths.size() - 1);
+            if (lastPath.isEmpty()) return lastPath;
+            List<Double> last = lastPath.get(lastPath.size() - 1);
+            if (Math.abs(last.get(0) - x) < 1.0 && Math.abs(last.get(1) - y) < 1.0) {
+                return lastPath;
+            }
+            return null;
+        }
+
+        private void appendStrokePoint(List<List<Double>> points, double x, double y) {
+            if (!points.isEmpty()) {
+                List<Double> last = points.get(points.size() - 1);
+                if (Math.abs(last.get(0) - x) < 0.25 && Math.abs(last.get(1) - y) < 0.25) {
+                    return;
+                }
+            }
+            points.add(List.of(x, y));
+        }
+
+        private double[] clipSegmentToBounds(double x0, double y0, double x1, double y1, Bounds b) {
+            double dx = x1 - x0;
+            double dy = y1 - y0;
+            double t0 = 0.0;
+            double t1 = 1.0;
+            double[] p = {-dx, dx, -dy, dy};
+            double[] q = {x0 - b.getMinX(), b.getMaxX() - x0, y0 - b.getMinY(), b.getMaxY() - y0};
+            for (int i = 0; i < 4; i++) {
+                if (Math.abs(p[i]) < 0.000001) {
+                    if (q[i] < 0) return null;
+                    continue;
+                }
+                double r = q[i] / p[i];
+                if (p[i] < 0) {
+                    if (r > t1) return null;
+                    if (r > t0) t0 = r;
+                } else {
+                    if (r < t0) return null;
+                    if (r < t1) t1 = r;
+                }
+            }
+            return new double[] {
+                x0 + t0 * dx,
+                y0 + t0 * dy,
+                x0 + t1 * dx,
+                y0 + t1 * dy
+            };
+        }
+
+        private void persistStrokeForPage(int page, List<List<List<Double>>> paths) throws Exception {
+            List<List<List<Double>>> validPaths = paths.stream().filter(p -> p.size() >= 2).toList();
+            if (validPaths.isEmpty()) return;
+            Bounds pageBounds = visiblePageBounds().get(page);
+            if (pageBounds == null) return;
+            LocalBookReader.PageTextMap map = reader.readPageTextMap(page);
+            double pageW = map.width();
+            double pageH = map.height();
+            if (pageW <= 0 || pageH <= 0) return;
+            double sx = pageW / Math.max(1.0, pageBounds.getWidth());
+            double sy = pageH / Math.max(1.0, pageBounds.getHeight());
+            StringBuilder sb = new StringBuilder("{");
+            sb.append("\"version\":2,");
+            sb.append("\"color\":\"").append(toHex(annotationColor.getValue())).append("\",");
+            sb.append("\"thickness\":").append(annotationThickness.getValue()).append(",");
+            sb.append("\"pageWidth\":").append(pageW).append(",");
+            sb.append("\"pageHeight\":").append(pageH).append(",");
+            sb.append("\"paths\":[");
+            for (int pathIndex = 0; pathIndex < validPaths.size(); pathIndex++) {
+                List<List<Double>> points = validPaths.get(pathIndex);
+                sb.append("[");
+                for (int i = 0; i < points.size(); i++) {
+                    List<Double> p = points.get(i);
+                    double px = (p.get(0) - pageBounds.getMinX()) * sx;
+                    double py = (p.get(1) - pageBounds.getMinY()) * sy;
+                    sb.append("[").append(px).append(",").append(py).append("]");
+                    if (i < points.size() - 1) sb.append(",");
+                }
+                sb.append("]");
+                if (pathIndex < validPaths.size() - 1) sb.append(",");
+            }
+            sb.append("]}");
+            store.addAnnotation(item.ebookId(), page, sb.toString());
         }
 
         private void undoAnnotation() {
@@ -1438,17 +1635,12 @@ public class MainWindow {
             if (selectionRect.getWidth() < 4 || selectionRect.getHeight() < 4) return;
             try {
                 String color = toHex(highlightColor.getValue());
-                Bounds lb = left.getBoundsInParent();
-                Bounds rb = right.getBoundsInParent();
-                int leftPage = currentPage <= 1 ? -1 : currentPage;
-                int rightPage = currentPage <= 1 ? 1 : currentPage + 1;
-                if (leftPage > 0 && intersects(selectionRect.getX(), selectionRect.getY(), selectionRect.getWidth(), selectionRect.getHeight(),
-                    lb.getMinX(), lb.getMinY(), lb.getWidth(), lb.getHeight())) {
-                    persistSelectionForPage(leftPage, lb, color);
-                }
-                if (intersects(selectionRect.getX(), selectionRect.getY(), selectionRect.getWidth(), selectionRect.getHeight(),
-                    rb.getMinX(), rb.getMinY(), rb.getWidth(), rb.getHeight())) {
-                    persistSelectionForPage(rightPage, rb, color);
+                for (Map.Entry<Integer, Bounds> entry : visiblePageBounds().entrySet()) {
+                    Bounds b = entry.getValue();
+                    if (intersects(selectionRect.getX(), selectionRect.getY(), selectionRect.getWidth(), selectionRect.getHeight(),
+                        b.getMinX(), b.getMinY(), b.getWidth(), b.getHeight())) {
+                        persistSelectionForPage(entry.getKey(), b, color);
+                    }
                 }
                 reloadHighlights();
                 redrawHighlights();
@@ -1577,7 +1769,7 @@ public class MainWindow {
                 return;
             }
             SearchResult r = searchResults.get(searchResultIndex);
-            currentPage = normalizePageForSpread(r.page());
+            currentPage = spreadMode ? normalizePageForSpread(r.page()) : r.page();
             render();
             updateSearchResultLabel();
             status.setText("Search result " + (searchResultIndex + 1) + " / " + searchResults.size() + " di halaman " + r.page());
@@ -1592,11 +1784,8 @@ public class MainWindow {
             searchOverlay.getChildren().clear();
             if (searchResults.isEmpty()) return;
             try {
-                if (currentPage <= 1) {
-                    drawSearchHighlightsForPage(1, right.getBoundsInParent());
-                } else {
-                    drawSearchHighlightsForPage(currentPage, left.getBoundsInParent());
-                    drawSearchHighlightsForPage(currentPage + 1, right.getBoundsInParent());
+                for (Map.Entry<Integer, Bounds> entry : visiblePageBounds().entrySet()) {
+                    drawSearchHighlightsForPage(entry.getKey(), entry.getValue());
                 }
             } catch (Exception ex) {
                 LOG.log(Level.WARNING, "Search highlight render failed", ex);
@@ -1631,15 +1820,73 @@ public class MainWindow {
         private void redrawHighlights() {
             highlightOverlay.getChildren().clear();
             try {
-                if (currentPage <= 1) {
-                    drawHighlightsForPage(1, right.getBoundsInParent());
-                } else {
-                    drawHighlightsForPage(currentPage, left.getBoundsInParent());
-                    drawHighlightsForPage(currentPage + 1, right.getBoundsInParent());
+                for (Map.Entry<Integer, Bounds> entry : visiblePageBounds().entrySet()) {
+                    drawHighlightsForPage(entry.getKey(), entry.getValue());
                 }
             } catch (Exception ex) {
                 status.setText("Gagal render highlight: " + ex.getMessage());
             }
+        }
+
+        private Map<Integer, Bounds> visiblePageBounds() throws Exception {
+            pageLayer.applyCss();
+            pageLayer.layout();
+            pages.applyCss();
+            pages.layout();
+            LinkedHashMap<Integer, Bounds> out = new LinkedHashMap<>();
+            int total = reader.totalPages();
+            if (!spreadMode) {
+                if (right.getImage() != null) {
+                    out.put(Math.min(currentPage, total), displayedImageBounds(right));
+                }
+                return out;
+            }
+            if (currentPage <= 1) {
+                if (right.getImage() != null) out.put(1, displayedImageBounds(right));
+                return out;
+            }
+            if (left.getImage() != null && currentPage <= total) {
+                out.put(currentPage, displayedImageBounds(left));
+            }
+            int rightPage = currentPage + 1;
+            if (right.getImage() != null && rightPage <= total) {
+                out.put(rightPage, displayedImageBounds(right));
+            }
+            return out;
+        }
+
+        private Bounds displayedImageBounds(ImageView view) {
+            Bounds node = view.getBoundsInParent();
+            Image img = view.getImage();
+            if (img == null || img.getWidth() <= 0 || img.getHeight() <= 0) {
+                return node;
+            }
+            double ratio = img.getWidth() / img.getHeight();
+            double maxW = view.getFitWidth() > 0 ? view.getFitWidth() : node.getWidth();
+            double maxH = view.getFitHeight() > 0 ? view.getFitHeight() : node.getHeight();
+            double actualW = maxW;
+            double actualH = maxW / ratio;
+            if (actualH > maxH) {
+                actualH = maxH;
+                actualW = actualH * ratio;
+            }
+            double x = node.getMinX() + Math.max(0, (node.getWidth() - actualW) / 2.0);
+            double y = node.getMinY() + Math.max(0, (node.getHeight() - actualH) / 2.0);
+            return new BoundingBox(x, y, Math.max(1.0, actualW), Math.max(1.0, actualH));
+        }
+
+        private int pageAtPoint(double x, double y) {
+            try {
+                for (Map.Entry<Integer, Bounds> entry : visiblePageBounds().entrySet()) {
+                    Bounds b = entry.getValue();
+                    if (x >= b.getMinX() && x <= b.getMaxX() && y >= b.getMinY() && y <= b.getMaxY()) {
+                        return entry.getKey();
+                    }
+                }
+            } catch (Exception ex) {
+                LOG.log(Level.FINE, "Unable to resolve annotation page", ex);
+            }
+            return -1;
         }
 
         private void drawHighlightsForPage(int page, Bounds b) throws Exception {
@@ -1674,29 +1921,31 @@ public class MainWindow {
         private void render() {
             try {
                 int total = reader.totalPages();
+                currentPage = Math.max(1, Math.min(currentPage, total));
                 store.upsertProgress(item.ebookId(), currentPage);
                 updatePageJumpText();
                 updateNavButtons();
+                left.setVisible(spreadMode);
+                left.setManaged(spreadMode);
                 right.setVisible(true);
+                right.setManaged(true);
+                if (!spreadMode) {
+                    left.setImage(null);
+                    right.setImage(reader.renderPageImage(currentPage));
+                    applyZoom();
+                    return;
+                }
                 if (currentPage <= 1) {
                     left.setImage(null);
                     right.setImage(reader.renderPageImage(1));
-                redrawWatermark();
-                redrawAnnotations();
-                redrawHighlights();
-                redrawSearchHighlights();
-                applyZoom();
-                return;
-            }
+                    applyZoom();
+                    return;
+                }
                 int leftPage = Math.min(currentPage, total);
                 int rightPage = Math.min(currentPage + 1, total);
                 left.setImage(reader.renderPageImage(leftPage));
                 right.setImage(rightPage <= total ? reader.renderPageImage(rightPage) : null);
-            redrawWatermark();
-            redrawAnnotations();
-            redrawHighlights();
-            redrawSearchHighlights();
-            applyZoom();
+                applyZoom();
             } catch (Exception ex) {
                 LOG.log(Level.WARNING, "Render failed", ex);
                 status.setText("Render error: " + ex.getMessage());
@@ -1707,9 +1956,11 @@ public class MainWindow {
             try {
                 GraphicsContext gc = annotation.getGraphicsContext2D();
                 gc.clearRect(0, 0, annotation.getWidth(), annotation.getHeight());
-                List<String> rows = store.listAnnotations(item.ebookId(), currentPage);
-                for (String row : rows) {
-                    drawStrokeJson(row, gc);
+                for (Map.Entry<Integer, Bounds> entry : visiblePageBounds().entrySet()) {
+                    List<String> rows = store.listAnnotations(item.ebookId(), entry.getKey());
+                    for (String row : rows) {
+                        drawStrokeJson(row, gc, entry.getValue());
+                    }
                 }
             } catch (Exception ex) {
                 status.setText("Gagal render annotation: " + ex.getMessage());
@@ -1744,25 +1995,47 @@ public class MainWindow {
             }
         }
 
-        private void drawStrokeJson(String json, GraphicsContext gc) {
+        private void drawStrokeJson(String json, GraphicsContext gc, Bounds pageBounds) {
             try {
-                String color = extract(json, "\"color\":\"", "\"");
-                String thick = extract(json, "\"thickness\":", ",");
-                String pointsBlock = extract(json, "\"points\":[", "]}");
-                gc.setStroke(Color.web(color == null ? "#ff0000" : color));
-                gc.setLineWidth(thick == null ? 2.0 : Double.parseDouble(thick));
-                String trimmed = pointsBlock == null ? "" : pointsBlock.trim();
-                if (trimmed.isEmpty()) return;
-                String[] pts = trimmed.split("\\],\\[");
+                JsonObject root = JsonParser.parseString(json).getAsJsonObject();
+                String color = root.has("color") ? root.get("color").getAsString() : "#ff0000";
+                double thickness = root.has("thickness") ? root.get("thickness").getAsDouble() : 2.0;
+                boolean pageRelative = root.has("version") && root.get("version").getAsInt() >= 2;
+                double pageW = root.has("pageWidth") ? root.get("pageWidth").getAsDouble() : 0.0;
+                double pageH = root.has("pageHeight") ? root.get("pageHeight").getAsDouble() : 0.0;
+                double sx = pageRelative && pageW > 0 ? pageBounds.getWidth() / pageW : 1.0;
+                double sy = pageRelative && pageH > 0 ? pageBounds.getHeight() / pageH : 1.0;
+                gc.setStroke(Color.web(color));
+                gc.setLineWidth(thickness);
+                if (root.has("paths") && root.get("paths").isJsonArray()) {
+                    for (var pathElement : root.getAsJsonArray("paths")) {
+                        if (pathElement.isJsonArray()) {
+                            drawAnnotationPointPath(pathElement.getAsJsonArray(), gc, pageBounds, pageRelative, sx, sy);
+                        }
+                    }
+                    return;
+                }
+                if (root.has("points") && root.get("points").isJsonArray()) {
+                    drawAnnotationPointPath(root.getAsJsonArray("points"), gc, pageBounds, pageRelative, sx, sy);
+                }
+            } catch (Exception ignored) {
+            }
+        }
+
+        private void drawAnnotationPointPath(JsonArray points, GraphicsContext gc, Bounds pageBounds, boolean pageRelative, double sx, double sy) {
+            try {
+                if (points == null || points.isEmpty()) return;
                 double prevX = 0;
                 double prevY = 0;
                 boolean first = true;
-                for (String p : pts) {
-                    String t = p.replace("[", "").replace("]", "");
-                    String[] xy = t.split(",");
-                    if (xy.length != 2) continue;
-                    double x = Double.parseDouble(xy[0]);
-                    double y = Double.parseDouble(xy[1]);
+                for (var pointElement : points) {
+                    if (!pointElement.isJsonArray()) continue;
+                    JsonArray xy = pointElement.getAsJsonArray();
+                    if (xy.size() < 2) continue;
+                    double rawX = xy.get(0).getAsDouble();
+                    double rawY = xy.get(1).getAsDouble();
+                    double x = pageRelative ? pageBounds.getMinX() + rawX * sx : rawX;
+                    double y = pageRelative ? pageBounds.getMinY() + rawY * sy : rawY;
                     if (first) {
                         gc.beginPath();
                         gc.moveTo(x, y);
@@ -1778,6 +2051,15 @@ public class MainWindow {
                     gc.stroke();
                 }
             } catch (Exception ignored) {
+            }
+        }
+
+        private double parseDoubleOr(String value, double fallback) {
+            if (value == null || value.isBlank()) return fallback;
+            try {
+                return Double.parseDouble(value.trim());
+            } catch (NumberFormatException ex) {
+                return fallback;
             }
         }
 
